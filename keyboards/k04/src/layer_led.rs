@@ -15,6 +15,7 @@ const LOW_BATTERY_BLINK_INTERVAL_MS: u64 = 2_000;
 const LOW_BATTERY_BLINK_ON_MS: u64 = 120;
 const SYSTEM_OFF_PURPLE_MS: u64 = 120;
 const SPLIT_CONNECTED_PULSE_MS: u64 = 520;
+const CONNECTION_LED_MAX_MS: u64 = 15_000;
 const BLE_LED_ADVERTISING: u8 = 0;
 const BLE_LED_RECONNECTING: u8 = 1;
 const BLE_LED_PAIRING: u8 = 2;
@@ -56,6 +57,8 @@ pub async fn layer_led_task(mut led: SequencePwm<'static>) {
     let mut connection_mode = ConnectionLedMode::None;
     let mut connection_mode_started = Instant::now();
     let mut last_connection_color: Option<Rgb> = None;
+    let mut connection_led_enabled = true;
+    let mut connection_led_wake_pending = false;
     let mut split_connected = true;
     let mut split_unpaired = false;
 
@@ -70,6 +73,8 @@ pub async fn layer_led_task(mut led: SequencePwm<'static>) {
             if let Some(state) = event.ble_led_state_code() {
                 match state {
                     BLE_LED_ADVERTISING => {
+                        let restart_when_disabled = connection_led_wake_pending;
+                        connection_led_wake_pending = false;
                         let mode = if split_unpaired {
                             ConnectionLedMode::SplitUnpaired
                         } else if !split_connected {
@@ -81,10 +86,14 @@ pub async fn layer_led_task(mut led: SequencePwm<'static>) {
                             &mut connection_mode,
                             &mut connection_mode_started,
                             &mut last_connection_color,
+                            &mut connection_led_enabled,
+                            restart_when_disabled,
                             mode,
                         );
                     }
                     BLE_LED_RECONNECTING => {
+                        let restart_when_disabled = connection_led_wake_pending;
+                        connection_led_wake_pending = false;
                         let mode = if split_unpaired {
                             ConnectionLedMode::SplitUnpaired
                         } else if !split_connected {
@@ -96,10 +105,14 @@ pub async fn layer_led_task(mut led: SequencePwm<'static>) {
                             &mut connection_mode,
                             &mut connection_mode_started,
                             &mut last_connection_color,
+                            &mut connection_led_enabled,
+                            restart_when_disabled,
                             mode,
                         );
                     }
                     BLE_LED_PAIRING => {
+                        let restart_when_disabled = connection_led_wake_pending;
+                        connection_led_wake_pending = false;
                         let mode = if split_unpaired {
                             ConnectionLedMode::SplitUnpaired
                         } else if !split_connected {
@@ -111,6 +124,8 @@ pub async fn layer_led_task(mut led: SequencePwm<'static>) {
                             &mut connection_mode,
                             &mut connection_mode_started,
                             &mut last_connection_color,
+                            &mut connection_led_enabled,
+                            restart_when_disabled,
                             mode,
                         );
                     }
@@ -126,6 +141,8 @@ pub async fn layer_led_task(mut led: SequencePwm<'static>) {
                             &mut connection_mode,
                             &mut connection_mode_started,
                             &mut last_connection_color,
+                            &mut connection_led_enabled,
+                            false,
                             mode,
                         );
                     }
@@ -134,17 +151,36 @@ pub async fn layer_led_task(mut led: SequencePwm<'static>) {
                             &mut connection_mode,
                             &mut connection_mode_started,
                             &mut last_connection_color,
+                            &mut connection_led_enabled,
+                            false,
                             ConnectionLedMode::None,
                         );
-                        restore_display(&mut led, displayed_layer, latest_battery).await;
+                        connection_led_enabled = false;
+                        last_connection_color = None;
+                        if displayed_layer.is_some_and(is_temporary) {
+                            displayed_layer = None;
+                        }
+                        send_color(&mut led, color_off()).await;
                     }
                     _ => {}
                 }
-                continue;
             }
 
             match event {
-                ControllerEvent::Key(_, _) => continue,
+                ControllerEvent::Key(event, _) => {
+                    if event.pressed() {
+                        if connection_mode_times_out(connection_mode) {
+                            connection_led_enabled = true;
+                            connection_mode_started = Instant::now();
+                            last_connection_color = None;
+                        } else if !connection_led_enabled
+                            && connection_mode == ConnectionLedMode::None
+                        {
+                            connection_led_wake_pending = true;
+                        }
+                    }
+                    continue;
+                }
                 ControllerEvent::Layer(layer) => {
                     let layer_changed = current_layer != Some(layer);
                     current_layer = Some(layer);
@@ -212,6 +248,8 @@ pub async fn layer_led_task(mut led: SequencePwm<'static>) {
                             &mut connection_mode,
                             &mut connection_mode_started,
                             &mut last_connection_color,
+                            &mut connection_led_enabled,
+                            true,
                             ConnectionLedMode::SplitMissing,
                         );
                     } else {
@@ -219,6 +257,8 @@ pub async fn layer_led_task(mut led: SequencePwm<'static>) {
                             &mut connection_mode,
                             &mut connection_mode_started,
                             &mut last_connection_color,
+                            &mut connection_led_enabled,
+                            true,
                             ConnectionLedMode::SplitConnectedPulse,
                         );
                     }
@@ -232,6 +272,8 @@ pub async fn layer_led_task(mut led: SequencePwm<'static>) {
                         &mut connection_mode,
                         &mut connection_mode_started,
                         &mut last_connection_color,
+                        &mut connection_led_enabled,
+                        true,
                         ConnectionLedMode::SplitUnpaired,
                     );
                     continue;
@@ -241,6 +283,8 @@ pub async fn layer_led_task(mut led: SequencePwm<'static>) {
                         &mut connection_mode,
                         &mut connection_mode_started,
                         &mut last_connection_color,
+                        &mut connection_led_enabled,
+                        false,
                         ConnectionLedMode::SystemOff,
                     );
                     continue;
@@ -249,21 +293,35 @@ pub async fn layer_led_task(mut led: SequencePwm<'static>) {
             }
         }
 
-        if let Some(color) = connection_led_color(connection_mode, connection_mode_started) {
-            if last_connection_color != Some(color) {
-                send_color(&mut led, color).await;
-                last_connection_color = Some(color);
-            }
-            Timer::after(Duration::from_millis(20)).await;
-            continue;
-        } else if last_connection_color.is_some() {
-            restore_display(&mut led, displayed_layer, latest_battery).await;
+        let temporary_display_active = displayed_layer.is_some_and(is_temporary);
+        if connection_led_enabled
+            && connection_mode_timed_out(connection_mode, connection_mode_started)
+        {
+            connection_led_enabled = false;
             last_connection_color = None;
-            if matches!(
-                connection_mode,
-                ConnectionLedMode::HostConnectedPulse | ConnectionLedMode::SplitConnectedPulse
-            ) {
-                connection_mode = ConnectionLedMode::None;
+            if temporary_display_active {
+                displayed_layer = None;
+            }
+            send_color(&mut led, color_off()).await;
+        }
+
+        if !temporary_display_active && connection_led_enabled {
+            if let Some(color) = connection_led_color(connection_mode, connection_mode_started) {
+                if last_connection_color != Some(color) {
+                    send_color(&mut led, color).await;
+                    last_connection_color = Some(color);
+                }
+                Timer::after(Duration::from_millis(20)).await;
+                continue;
+            } else if last_connection_color.is_some() {
+                restore_display(&mut led, displayed_layer, latest_battery).await;
+                last_connection_color = None;
+                if matches!(
+                    connection_mode,
+                    ConnectionLedMode::HostConnectedPulse | ConnectionLedMode::SplitConnectedPulse
+                ) {
+                    connection_mode = ConnectionLedMode::None;
+                }
             }
         }
 
@@ -303,17 +361,35 @@ fn set_connection_mode(
     mode: &mut ConnectionLedMode,
     mode_started: &mut Instant,
     last_color: &mut Option<Rgb>,
+    led_enabled: &mut bool,
+    restart_when_disabled: bool,
     next: ConnectionLedMode,
 ) {
+    let timed_connection_mode = connection_mode_times_out(next);
     if *mode != next {
+        let keep_started = same_host_attempt_transition(*mode, next);
         *mode = next;
+        if !keep_started {
+            *mode_started = Instant::now();
+        }
+        *last_color = None;
+        if *led_enabled || !timed_connection_mode || restart_when_disabled {
+            *led_enabled = true;
+        }
+    } else if restart_when_disabled && !*led_enabled && connection_mode_restarts_on_same_event(next)
+    {
         *mode_started = Instant::now();
         *last_color = None;
+        *led_enabled = true;
     }
 }
 
 fn connection_led_color(mode: ConnectionLedMode, started: Instant) -> Option<Rgb> {
     let elapsed_ms = Instant::now().duration_since(started).as_millis() as u64;
+    if connection_mode_times_out(mode) && elapsed_ms >= CONNECTION_LED_MAX_MS {
+        return None;
+    }
+
     let color = match mode {
         ConnectionLedMode::None => return None,
         ConnectionLedMode::Advertising => blink_color(color_blue(), elapsed_ms, 1_000, 500),
@@ -332,6 +408,42 @@ fn connection_led_color(mode: ConnectionLedMode, started: Instant) -> Option<Rgb
         }
     };
     Some(color)
+}
+
+fn connection_mode_times_out(mode: ConnectionLedMode) -> bool {
+    matches!(
+        mode,
+        ConnectionLedMode::Advertising
+            | ConnectionLedMode::Reconnecting
+            | ConnectionLedMode::Pairing
+            | ConnectionLedMode::SplitMissing
+            | ConnectionLedMode::SplitUnpaired
+    )
+}
+
+fn connection_mode_timed_out(mode: ConnectionLedMode, started: Instant) -> bool {
+    connection_mode_times_out(mode)
+        && Instant::now().duration_since(started).as_millis() as u64 >= CONNECTION_LED_MAX_MS
+}
+
+fn connection_mode_restarts_on_same_event(mode: ConnectionLedMode) -> bool {
+    matches!(
+        mode,
+        ConnectionLedMode::SplitMissing | ConnectionLedMode::SplitUnpaired
+    )
+}
+
+fn same_host_attempt_transition(current: ConnectionLedMode, next: ConnectionLedMode) -> bool {
+    matches!(
+        (current, next),
+        (
+            ConnectionLedMode::Reconnecting,
+            ConnectionLedMode::Advertising
+        ) | (
+            ConnectionLedMode::Advertising,
+            ConnectionLedMode::Reconnecting
+        )
+    )
 }
 
 fn host_connected_pulse_color(elapsed_ms: u64) -> Option<Rgb> {

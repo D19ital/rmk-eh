@@ -19,6 +19,7 @@ use crate::{
 };
 
 const SPLIT_COMPANY_ID: u16 = 0xe118;
+const SPLIT_CONNECT_ATTEMPT_SECONDS: u64 = 15;
 
 /// Gatt service used in split peripheral to send split message to central
 #[gatt_service(uuid = "4dd5fbaa-18e5-4b07-bf0a-353698659946")]
@@ -325,6 +326,26 @@ async fn clear_saved_central_peer<
 
 /// Create an advertiser to use to connect to a BLE Central, and wait for it to connect.
 async fn split_peripheral_advertise<'a, 'b, C: Controller>(
+    id: usize,
+    central_addr: Option<[u8; 6]>,
+    peripheral: &mut Peripheral<'a, C, DefaultPacketPool>,
+    server: &'b BleSplitPeripheralServer<'_>,
+) -> Result<GattConnection<'a, 'b, DefaultPacketPool>, BleHostError<C::Error>> {
+    match with_timeout(
+        Duration::from_secs(SPLIT_CONNECT_ATTEMPT_SECONDS),
+        split_peripheral_advertise_until_connected(id, central_addr, peripheral, server),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            warn!("[adv] split central connection attempt timeout");
+            Err(BleHostError::BleHost(Error::Timeout))
+        }
+    }
+}
+
+async fn split_peripheral_advertise_until_connected<'a, 'b, C: Controller>(
     id: usize,
     central_addr: Option<[u8; 6]>,
     peripheral: &mut Peripheral<'a, C, DefaultPacketPool>,

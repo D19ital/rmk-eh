@@ -6,7 +6,7 @@ use bt_hci::controller::{ControllerCmdAsync, ControllerCmdSync};
 use embassy_futures::select::{Either, Either3, select, select3};
 use embassy_sync::mutex::Mutex;
 use embassy_sync::signal::Signal;
-use embassy_time::{Duration, Timer, with_timeout};
+use embassy_time::{Duration, Instant, Timer, with_timeout};
 use embedded_storage_async::nor_flash::NorFlash;
 use heapless::{Vec, VecView};
 use trouble_host::prelude::*;
@@ -50,6 +50,7 @@ const SPLIT_SERVICE_UUID: [u8; 16] = [
 const SPLIT_COMPANY_ID: u16 = 0xe118;
 
 const DEFAULT_SLEEP_TIMEOUT_SECONDS: u64 = 30 * 60;
+const SPLIT_CONNECT_ATTEMPT_SECONDS: u64 = 15;
 const SLEEP_TIMEOUT_SECONDS: [u64; 10] = [
     10 * 60,
     15 * 60,
@@ -264,6 +265,7 @@ pub(crate) async fn run_ble_peripheral_manager<
     let mut controller_pub = unwrap!(CONTROLLER_CHANNEL.publisher());
     #[cfg(all(feature = "controller", feature = "storage"))]
     let mut controller_sub = unwrap!(CONTROLLER_CHANNEL.subscriber());
+    let mut reconnect_started = Instant::now();
 
     loop {
         #[cfg(all(feature = "controller", feature = "storage"))]
@@ -356,6 +358,7 @@ pub(crate) async fn run_ble_peripheral_manager<
                         drop_uncommitted_peer_candidate(peri_id, addrs, &mut controller_pub);
                     }
                 }
+                reconnect_started = Instant::now();
             }
             Ok(Err(e)) => {
                 #[cfg(feature = "defmt")]
@@ -368,6 +371,12 @@ pub(crate) async fn run_ble_peripheral_manager<
                 warn!("Connect to peripheral {} timeout, keeping saved address", peri_id);
                 drop_uncommitted_peer_candidate(peri_id, addrs, &mut controller_pub);
             }
+        }
+        if Instant::now().duration_since(reconnect_started).as_secs() >= SPLIT_CONNECT_ATTEMPT_SECONDS {
+            warn!("Split peripheral {} reconnect timeout, waiting for activity", peri_id);
+            crate::channel::ACTIVITY_SIGNAL.reset();
+            crate::channel::ACTIVITY_SIGNAL.wait().await;
+            reconnect_started = Instant::now();
         }
         // Reconnect after 500ms
         embassy_time::Timer::after_millis(500).await;

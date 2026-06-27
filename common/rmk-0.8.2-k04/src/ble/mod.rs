@@ -3,8 +3,8 @@ use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use bt_hci::cmd::le::{LeReadLocalSupportedFeatures, LeSetPhy};
 use bt_hci::controller::{ControllerCmdAsync, ControllerCmdSync};
 use embassy_futures::join::join;
-use embassy_futures::select::{Either3, select, select3};
-use embassy_time::{Duration, Timer, with_timeout};
+use embassy_futures::select::{Either3, Either5, select, select3, select5};
+use embassy_time::{Duration, Instant, Timer, with_timeout};
 use rand_core::{CryptoRng, RngCore};
 use rmk_types::led_indicator::LedIndicator;
 use trouble_host::prelude::appearance::human_interface_device::KEYBOARD;
@@ -42,7 +42,7 @@ use crate::ble::ble_server::{BleHidServer, Server};
 use crate::ble::device_info::{PnPID, VidSource};
 use crate::ble::led::BleLedReader;
 use crate::ble::profile::{ProfileInfo, ProfileManager, UPDATED_CCCD_TABLE, UPDATED_PROFILE};
-use crate::channel::{KEYBOARD_REPORT_CHANNEL, LED_SIGNAL};
+use crate::channel::{ACTIVITY_SIGNAL, LED_SIGNAL};
 use crate::config::RmkConfig;
 use crate::hid::{DummyWriter, RunnableHidWriter};
 #[cfg(feature = "split")]
@@ -77,7 +77,8 @@ pub enum BleState {
 /// The number of the active profile
 pub static ACTIVE_PROFILE: AtomicU8 = AtomicU8::new(0);
 
-const DIRECTED_RECONNECT_ROUNDS: usize = 8;
+const BLE_CONNECT_ATTEMPT_SECONDS: u64 = 15;
+const DIRECTED_RECONNECT_ROUNDS: usize = 4;
 const DIRECTED_RECONNECT_WINDOW_MS: u64 = 1300;
 
 /// Global state of sleep management
@@ -256,22 +257,60 @@ pub(crate) async fn run_ble<
     join(background_task, async {
         #[cfg(feature = "controller")]
         let mut controller_pub = unwrap!(CONTROLLER_CHANNEL.publisher());
+        let mut ble_attempt_profile = ACTIVE_PROFILE.load(Ordering::Relaxed);
+        let mut ble_attempt_started = Instant::now();
         loop {
-            // Advertising state
-            #[cfg(feature = "controller")]
-            send_controller_event(
-                &mut controller_pub,
-                ControllerEvent::BleState(ACTIVE_PROFILE.load(Ordering::Relaxed), BleState::Advertising),
-            );
+            let active_profile = ACTIVE_PROFILE.load(Ordering::Relaxed);
+            if active_profile != ble_attempt_profile {
+                ble_attempt_profile = active_profile;
+                ble_attempt_started = Instant::now();
+            }
+            let ble_attempt_elapsed_ms = Instant::now().duration_since(ble_attempt_started).as_millis() as u64;
+            if ble_attempt_elapsed_ms >= BLE_CONNECT_ATTEMPT_SECONDS * 1_000 {
+                warn!("Advertising window expired, sleep and wait for any key");
+                #[cfg(feature = "controller")]
+                send_controller_event(
+                    &mut controller_pub,
+                    ControllerEvent::BleState(active_profile, BleState::None),
+                );
+                // Set CONNECTION_STATE to true to keep receiving messages from the peripheral.
+                CONNECTION_STATE.store(ConnectionState::Connected.into(), Ordering::Release);
+
+                // Enter sleep mode to reduce the power consumption.
+                #[cfg(feature = "split")]
+                CENTRAL_SLEEP.signal(true);
+
+                wait_for_ble_wake(
+                    #[cfg(feature = "storage")]
+                    storage,
+                )
+                .await;
+
+                // Quit from sleep mode.
+                #[cfg(feature = "split")]
+                CENTRAL_SLEEP.signal(false);
+
+                ble_attempt_profile = ACTIVE_PROFILE.load(Ordering::Relaxed);
+                ble_attempt_started = Instant::now();
+                continue;
+            }
+            let ble_attempt_remaining =
+                Duration::from_millis(BLE_CONNECT_ATTEMPT_SECONDS * 1_000 - ble_attempt_elapsed_ms);
             let active_peer = profile_manager.active_peer_bd_addr();
-            let adv_fut = advertise(rmk_config.device_config.product_name, &mut peripheral, &server, active_peer);
+            let adv_fut = advertise(
+                rmk_config.device_config.product_name,
+                &mut peripheral,
+                &server,
+                active_peer,
+                ble_attempt_started,
+            );
             // USB + BLE dual mode
             #[cfg(not(feature = "_no_usb"))]
             {
                 match get_connection_type() {
                     ConnectionType::Usb => {
                         info!("USB priority mode, waiting for USB enabled or BLE connection");
-                        match select4(
+                        match select5(
                             USB_ENABLED.wait(),
                             adv_fut,
                             #[cfg(feature = "storage")]
@@ -279,15 +318,19 @@ pub(crate) async fn run_ble<
                             #[cfg(not(feature = "storage"))]
                             run_dummy_keyboard(),
                             profile_manager.update_profile(),
+                            Timer::after(ble_attempt_remaining),
                         )
                         .await
                         {
-                            Either4::First(_) => {
+                            Either5::First(_) => {
                                 info!("USB enabled, run USB keyboard");
                                 #[cfg(feature = "controller")]
                                 send_controller_event(
                                     &mut controller_pub,
-                                    ControllerEvent::BleState(0, BleState::None),
+                                    ControllerEvent::BleState(
+                                        ACTIVE_PROFILE.load(Ordering::Relaxed),
+                                        BleState::None,
+                                    ),
                                 );
                                 // Re-send the consumed flag
                                 USB_ENABLED.signal(());
@@ -305,12 +348,15 @@ pub(crate) async fn run_ble<
                                     UsbKeyboardWriter::new(&mut keyboard_writer, &mut other_writer),
                                 );
                                 select(usb_fut, profile_manager.update_profile()).await;
+                                ble_attempt_profile = ACTIVE_PROFILE.load(Ordering::Relaxed);
+                                ble_attempt_started = Instant::now();
                             }
-                            Either4::Second(Ok(conn)) => {
+                            Either5::Second(Ok(conn)) => {
                                 info!("No USB, BLE connected, run BLE keyboard");
                                 if USB_SUSPENDED.signaled() {
                                     USB_SUSPENDED.reset();
                                 }
+                                let connection_started = Instant::now();
                                 let ble_fut = run_ble_keyboard(
                                     &server,
                                     &conn,
@@ -323,14 +369,20 @@ pub(crate) async fn run_ble<
                                     storage,
                                 );
                                 select3(ble_fut, USB_SUSPENDED.wait(), profile_manager.update_profile()).await;
+                                ble_attempt_profile = ACTIVE_PROFILE.load(Ordering::Relaxed);
+                                refresh_attempt_after_connection(connection_started, &mut ble_attempt_started);
                                 continue;
                             }
-                            Either4::Second(Err(BleHostError::BleHost(Error::Timeout))) => {
+                            Either5::Second(Err(BleHostError::BleHost(Error::Timeout)))
+                            | Either5::Fifth(_) => {
                                 warn!("Advertising timeout, sleep and wait for any key");
                                 #[cfg(feature = "controller")]
                                 send_controller_event(
                                     &mut controller_pub,
-                                    ControllerEvent::BleState(0, BleState::None),
+                                    ControllerEvent::BleState(
+                                        ACTIVE_PROFILE.load(Ordering::Relaxed),
+                                        BleState::None,
+                                    ),
                                 );
                                 // Set CONNECTION_STATE to true to keep receiving messages from the peripheral
                                 CONNECTION_STATE.store(ConnectionState::Connected.into(), Ordering::Release);
@@ -339,12 +391,17 @@ pub(crate) async fn run_ble<
                                 #[cfg(feature = "split")]
                                 CENTRAL_SLEEP.signal(true);
 
-                                // Wait for the keyboard report for wake the keyboard
-                                let _ = KEYBOARD_REPORT_CHANNEL.receive().await;
+                                wait_for_ble_wake(
+                                    #[cfg(feature = "storage")]
+                                    storage,
+                                )
+                                .await;
 
                                 // Quit from sleep mode
                                 #[cfg(feature = "split")]
                                 CENTRAL_SLEEP.signal(false);
+                                ble_attempt_profile = ACTIVE_PROFILE.load(Ordering::Relaxed);
+                                ble_attempt_started = Instant::now();
                                 continue;
                             }
                             _ => {}
@@ -365,9 +422,17 @@ pub(crate) async fn run_ble<
                             UsbLedReader::new(&mut keyboard_reader),
                             UsbKeyboardWriter::new(&mut keyboard_writer, &mut other_writer),
                         );
-                        match select3(adv_fut, usb_fut, profile_manager.update_profile()).await {
-                            Either3::First(Ok(conn)) => {
+                        match select4(
+                            adv_fut,
+                            usb_fut,
+                            profile_manager.update_profile(),
+                            Timer::after(ble_attempt_remaining),
+                        )
+                        .await
+                        {
+                            Either4::First(Ok(conn)) => {
                                 info!("BLE connected, running BLE keyboard");
+                                let connection_started = Instant::now();
                                 select(
                                     run_ble_keyboard(
                                         &server,
@@ -383,14 +448,20 @@ pub(crate) async fn run_ble<
                                     profile_manager.update_profile(),
                                 )
                                 .await;
+                                ble_attempt_profile = ACTIVE_PROFILE.load(Ordering::Relaxed);
+                                refresh_attempt_after_connection(connection_started, &mut ble_attempt_started);
                             }
-                            Either3::First(Err(BleHostError::BleHost(Error::Timeout))) => {
+                            Either4::First(Err(BleHostError::BleHost(Error::Timeout)))
+                            | Either4::Fourth(_) => {
                                 warn!("Advertising timeout, sleep and wait for any key");
 
                                 #[cfg(feature = "controller")]
                                 send_controller_event(
                                     &mut controller_pub,
-                                    ControllerEvent::BleState(0, BleState::None),
+                                    ControllerEvent::BleState(
+                                        ACTIVE_PROFILE.load(Ordering::Relaxed),
+                                        BleState::None,
+                                    ),
                                 );
                                 // Set CONNECTION_STATE to true to keep receiving messages from the peripheral
                                 CONNECTION_STATE.store(ConnectionState::Connected.into(), Ordering::Release);
@@ -399,13 +470,18 @@ pub(crate) async fn run_ble<
                                 #[cfg(feature = "split")]
                                 CENTRAL_SLEEP.signal(true);
 
-                                // Wait for the keyboard report for wake the keyboard
-                                let _ = KEYBOARD_REPORT_CHANNEL.receive().await;
+                                wait_for_ble_wake(
+                                    #[cfg(feature = "storage")]
+                                    storage,
+                                )
+                                .await;
 
                                 // Quit from sleep mode
                                 #[cfg(feature = "split")]
                                 CENTRAL_SLEEP.signal(false);
 
+                                ble_attempt_profile = ACTIVE_PROFILE.load(Ordering::Relaxed);
+                                ble_attempt_started = Instant::now();
                                 continue;
                             }
                             _ => {}
@@ -418,6 +494,7 @@ pub(crate) async fn run_ble<
             match adv_fut.await {
                 Ok(conn) => {
                     // BLE connected
+                    let connection_started = Instant::now();
                     select(
                         run_ble_keyboard(
                             &server,
@@ -433,6 +510,8 @@ pub(crate) async fn run_ble<
                         profile_manager.update_profile(),
                     )
                     .await;
+                    ble_attempt_profile = ACTIVE_PROFILE.load(Ordering::Relaxed);
+                    refresh_attempt_after_connection(connection_started, &mut ble_attempt_started);
                 }
                 Err(BleHostError::BleHost(Error::Timeout)) => {
                     warn!("Advertising timeout, sleep and wait for any key");
@@ -444,12 +523,17 @@ pub(crate) async fn run_ble<
                     #[cfg(feature = "split")]
                     CENTRAL_SLEEP.signal(true);
 
-                    // Wait for the keyboard report for wake the keyboard
-                    let _ = KEYBOARD_REPORT_CHANNEL.receive().await;
+                    wait_for_ble_wake(
+                        #[cfg(feature = "storage")]
+                        storage,
+                    )
+                    .await;
 
                     // Quit from sleep mode
                     #[cfg(feature = "split")]
                     CENTRAL_SLEEP.signal(false);
+                    ble_attempt_profile = ACTIVE_PROFILE.load(Ordering::Relaxed);
+                    ble_attempt_started = Instant::now();
                     continue;
                 }
                 Err(e) => {
@@ -735,6 +819,47 @@ async fn advertise<'a, 'b, C: Controller>(
     peripheral: &mut Peripheral<'a, C, DefaultPacketPool>,
     server: &'b Server<'_>,
     active_peer: Option<BdAddr>,
+    attempt_started: Instant,
+) -> Result<GattConnection<'a, 'b, DefaultPacketPool>, BleHostError<C::Error>> {
+    let timeout = remaining_ble_attempt_timeout(attempt_started)
+        .ok_or(BleHostError::BleHost(Error::Timeout))?;
+    match with_timeout(
+        timeout,
+        advertise_until_connected(name, peripheral, server, active_peer, attempt_started),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            warn!("[adv] BLE connection attempt timeout");
+            Err(BleHostError::BleHost(Error::Timeout))
+        }
+    }
+}
+
+fn remaining_ble_attempt_timeout(attempt_started: Instant) -> Option<Duration> {
+    let elapsed_ms = Instant::now().duration_since(attempt_started).as_millis() as u64;
+    let total_ms = BLE_CONNECT_ATTEMPT_SECONDS * 1_000;
+    if elapsed_ms >= total_ms {
+        None
+    } else {
+        Some(Duration::from_millis(total_ms - elapsed_ms))
+    }
+}
+
+fn refresh_attempt_after_connection(connection_started: Instant, attempt_started: &mut Instant) {
+    let connected_ms = Instant::now().duration_since(connection_started).as_millis() as u64;
+    if connected_ms >= BLE_CONNECT_ATTEMPT_SECONDS * 1_000 {
+        *attempt_started = Instant::now();
+    }
+}
+
+async fn advertise_until_connected<'a, 'b, C: Controller>(
+    name: &'a str,
+    peripheral: &mut Peripheral<'a, C, DefaultPacketPool>,
+    server: &'b Server<'_>,
+    active_peer: Option<BdAddr>,
+    attempt_started: Instant,
 ) -> Result<GattConnection<'a, 'b, DefaultPacketPool>, BleHostError<C::Error>> {
     // Wait for 10ms to ensure the USB is checked
     embassy_time::Timer::after_millis(10).await;
@@ -760,12 +885,6 @@ async fn advertise<'a, 'b, C: Controller>(
         interval_max: Duration::from_millis(30),
         ..Default::default()
     };
-    let slow_advertise_config = AdvertisementParameters {
-        interval_min: Duration::from_millis(200),
-        interval_max: Duration::from_millis(200),
-        ..fast_advertise_config
-    };
-
     if let Some(addr) = active_peer {
         #[cfg(feature = "controller")]
         send_controller_event_new(ControllerEvent::BleState(
@@ -785,13 +904,23 @@ async fn advertise<'a, 'b, C: Controller>(
                 },
             ] {
                 info!("[adv] directed high duty advertising");
+                let Some(remaining) = remaining_ble_attempt_timeout(attempt_started) else {
+                    warn!("[adv] directed reconnect timeout");
+                    return Err(BleHostError::BleHost(Error::Timeout));
+                };
+                let remaining_ms = remaining.as_millis() as u64;
+                let window_ms = if remaining_ms < DIRECTED_RECONNECT_WINDOW_MS {
+                    remaining_ms
+                } else {
+                    DIRECTED_RECONNECT_WINDOW_MS
+                };
                 let advertiser = peripheral
                     .advertise(
                         &fast_advertise_config,
                         Advertisement::ConnectableNonscannableDirectedHighDuty { peer },
                     )
                     .await?;
-                match with_timeout(Duration::from_millis(DIRECTED_RECONNECT_WINDOW_MS), advertiser.accept()).await {
+                match with_timeout(Duration::from_millis(window_ms), advertiser.accept()).await {
                     Ok(conn_res) => {
                         let conn = conn_res?.with_attribute_server(server)?;
                         info!("[adv] directed connection established");
@@ -805,6 +934,11 @@ async fn advertise<'a, 'b, C: Controller>(
             }
         }
     }
+
+    let Some(remaining) = remaining_ble_attempt_timeout(attempt_started) else {
+        warn!("[adv] BLE connection attempt timeout before undirected advertising");
+        return Err(BleHostError::BleHost(Error::Timeout));
+    };
 
     #[cfg(feature = "controller")]
     send_controller_event_new(ControllerEvent::BleState(
@@ -826,7 +960,7 @@ async fn advertise<'a, 'b, C: Controller>(
             },
         )
         .await?;
-    match with_timeout(Duration::from_secs(30), advertiser.accept()).await {
+    match with_timeout(remaining, advertiser.accept()).await {
         Ok(conn_res) => {
             let conn = conn_res?.with_attribute_server(server)?;
             info!("[adv] connection established");
@@ -836,22 +970,8 @@ async fn advertise<'a, 'b, C: Controller>(
             Ok(conn)
         }
         Err(_) => {
-            info!("[adv] slow advertising");
-            let advertiser = peripheral
-                .advertise(
-                    &slow_advertise_config,
-                    Advertisement::ConnectableScannableUndirected {
-                        adv_data: &advertiser_data[..],
-                        scan_data: &[],
-                    },
-                )
-                .await?;
-            let conn = advertiser.accept().await?.with_attribute_server(server)?;
-            info!("[adv] connection established");
-            if let Err(e) = conn.raw().set_bondable(true) {
-                error!("Set bondable error: {:?}", e);
-            };
-            Ok(conn)
+            warn!("[adv] fast advertising timeout");
+            Err(BleHostError::BleHost(Error::Timeout))
         }
     }
 }
@@ -875,6 +995,28 @@ pub(crate) async fn run_dummy_keyboard<
     select(storage_fut, dummy_writer.run_writer()).await;
     #[cfg(not(feature = "storage"))]
     dummy_writer.run_writer().await;
+}
+
+async fn wait_for_ble_wake<
+    #[cfg(feature = "storage")] F: AsyncNorFlash,
+    #[cfg(feature = "storage")] const ROW: usize,
+    #[cfg(feature = "storage")] const COL: usize,
+    #[cfg(feature = "storage")] const NUM_LAYER: usize,
+    #[cfg(feature = "storage")] const NUM_ENCODER: usize,
+>(
+    #[cfg(feature = "storage")] storage: &mut Storage<F, ROW, COL, NUM_LAYER, NUM_ENCODER>,
+) {
+    ACTIVITY_SIGNAL.reset();
+    let wake_fut = async {
+        ACTIVITY_SIGNAL.wait().await;
+        // Let the key event that woke BLE reach controller/LED/report tasks
+        // before dropping the dummy keyboard loop.
+        Timer::after_millis(30).await;
+    };
+    #[cfg(feature = "storage")]
+    let _ = select(run_dummy_keyboard(storage), wake_fut).await;
+    #[cfg(not(feature = "storage"))]
+    let _ = select(run_dummy_keyboard(), wake_fut).await;
 }
 
 pub(crate) async fn set_conn_params<
