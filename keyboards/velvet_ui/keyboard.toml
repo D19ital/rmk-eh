@@ -119,8 +119,31 @@ _ _ _ _ _ _
 _ _ _
 """
 
+[[behavior.auto_mouse_layer]]
+device_id = 0
+target_layer = 4
+timeout = "350ms"
+threshold = 1
+
+[event.pointing]
+channel_size = 16
+pubs = 2
+subs = 4
+
+[event.layer_change]
+channel_size = 2
+pubs = 2
+subs = 4
+
+[event.keyboard]
+channel_size = 16
+pubs = 2
+subs = 5
+
 [ble]
 enabled = true
+default_tx_power = 8
+use_2m_phy = true
 # Battery ADC: P0_31 (AIN7), voltage divider 1564k/(806k+1564k)
 battery_adc_pin = "P0_31"
 adc_divider_measured = 782
@@ -151,9 +174,10 @@ col_offset = 0
 row_pins = ["P1_13", "P0_02", "P0_29", "P0_30"]
 col_pins = ["P0_24", "P0_09", "P0_10", "P1_11", "P1_10", "P0_03"]
 
-# PMW3610 trackball on peripheral (right half)
+# V15 diagnostic: PMW3610 sends full PointingEvent over split BLE with lightweight notify.
 [[split.peripheral.input_device.pmw3610]]
 name = "trackball0"
+id = 0
 spi.instance = "bitbang0"
 spi.sck = "P0_08"
 spi.mosi = "P0_17"
@@ -161,12 +185,18 @@ spi.miso = "P0_17"
 spi.cs = "P0_13"
 motion = "P0_15"
 cpi = 1000
-swap_xy = true
-invert_x = true
-invert_y = true
+report_hz = 125
+smart_mode = true
+swap_xy = false
+invert_x = false
+invert_y = false
+proc_swap_xy = true
+proc_invert_x = true
+proc_invert_y = true
 
 [rmk]
 split_peripherals_num = 1
+report_channel_size = 4
 combo_max_num = 32
 morse_max_num = 32
 macro_space_size = 2048
