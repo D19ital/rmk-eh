@@ -17,11 +17,15 @@ use crate::vial_settings::{
 
 const PROBE_INTERVAL_MS: u64 = 250;
 const MOTION_WAIT_CHECK_MS: u64 = 100;
-// Match Ergohaven ZMK PMW3610 report cadence to reduce BLE mouse traffic.
-const REPORT_INTERVAL_MS: u32 = 12;
+// Match Velvet UI V16 PMW3610 reporting cadence.
+const REPORT_INTERVAL_MS: u32 = 8;
 const MOTION_ACCUM_LIMIT: i32 = (i8::MAX as i32) * 2;
 const CUSTOM_MAGIC: [u8; 4] = *b"K04P";
 const CUSTOM_MOTION: u8 = 3;
+const PMW3610_DEFAULT_CPI: i16 = 1000;
+const PMW3610_PROC_SWAP_XY: bool = true;
+const PMW3610_PROC_INVERT_X: bool = true;
+const PMW3610_PROC_INVERT_Y: bool = true;
 
 pub type K04Trackball =
     Pmw3610<BitBangSpiBus<Output<'static>, Flex<'static>>, Output<'static>, Input<'static>>;
@@ -34,8 +38,8 @@ pub fn new_trackball(
 ) -> K04Trackball {
     let spi = BitBangSpiBus::new(sck, sdio);
     let config = Pmw3610Config {
-        res_cpi: 1000,
-        swap_xy: true,
+        res_cpi: PMW3610_DEFAULT_CPI,
+        swap_xy: false,
         invert_x: false,
         invert_y: false,
         force_awake: false,
@@ -172,17 +176,31 @@ async fn send_accumulated_motion(acc_x: &mut i32, acc_y: &mut i32, side: ModuleS
         return false;
     }
 
-    let report_x = (*acc_x).clamp(i8::MIN as i32, i8::MAX as i32) as i16;
-    let report_y = (*acc_y).clamp(i8::MIN as i32, i8::MAX as i32) as i16;
+    let drain_x = (*acc_x).clamp(i8::MIN as i32, i8::MAX as i32) as i16;
+    let drain_y = (*acc_y).clamp(i8::MIN as i32, i8::MAX as i32) as i16;
+    let (report_x, report_y) = apply_v16_pointing_transform(drain_x, drain_y);
     let event = custom_motion(side, ModuleKind::Ball, report_x, report_y);
 
     if send_motion_event_latest(event) {
-        *acc_x -= report_x as i32;
-        *acc_y -= report_y as i32;
+        *acc_x -= drain_x as i32;
+        *acc_y -= drain_y as i32;
         true
     } else {
         false
     }
+}
+
+fn apply_v16_pointing_transform(mut x: i16, mut y: i16) -> (i16, i16) {
+    if PMW3610_PROC_SWAP_XY {
+        core::mem::swap(&mut x, &mut y);
+    }
+    if PMW3610_PROC_INVERT_X {
+        x = x.saturating_neg();
+    }
+    if PMW3610_PROC_INVERT_Y {
+        y = y.saturating_neg();
+    }
+    (x, y)
 }
 
 fn send_motion_event_latest(event: Event) -> bool {
